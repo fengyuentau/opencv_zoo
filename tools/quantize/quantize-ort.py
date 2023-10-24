@@ -14,43 +14,75 @@ from onnx import version_converter
 import onnxruntime
 from onnxruntime.quantization import quantize_static, CalibrationDataReader, QuantType, QuantFormat
 
-from transform import Compose, Resize, CenterCrop, Normalize, ColorConvert, HandAlign
+from transform import Compose, Resize, CenterCrop, Normalize, ColorConvert, HandAlign, VitTrackCrop
 
 class DataReader(CalibrationDataReader):
-    def __init__(self, model_path, image_dir, transforms, data_dim):
+    def __init__(self, model_path, calib_data_dir, transforms, data_dim):
         model = onnx.load(model_path)
         self.input_name = model.graph.input[0].name
+        self.input1_name = model.graph.input[1].name
         self.transforms = transforms
         self.data_dim = data_dim
-        self.data = self.get_calibration_data(image_dir)
-        self.enum_data_dicts = iter([{self.input_name: x} for x in self.data])
+        self.data = self.get_calibration_data(calib_data_dir)
+        print(len(self.data))
+        self.enum_data_dicts = iter([{self.input_name: self.data[0], self.input1_name: x} for x in self.data[1:]])
 
     def get_next(self):
         return next(self.enum_data_dicts, None)
 
-    def get_calibration_data(self, image_dir):
+    def get_calibration_data(self, calib_data_dir):
         blobs = []
-        supported = ["jpg", "png"]  # supported file suffix
-        for image_name in os.listdir(image_dir):
-            image_name_suffix = image_name.split('.')[-1].lower()
-            if image_name_suffix not in supported:
+        supported = ["jpg", "png", "mp4"]  # supported file suffix
+        for file_name in os.listdir(calib_data_dir):
+            file_name_suffix = file_name.split('.')[-1].lower()
+            if file_name_suffix not in supported:
                 continue
-            img = cv.imread(os.path.join(image_dir, image_name))
-            img = self.transforms(img)
-            if img is None:
-                continue
-            blob = cv.dnn.blobFromImage(img)
-            if self.data_dim == 'hwc':
-                blob = cv.transposeND(blob, [0, 2, 3, 1])
-            blobs.append(blob)
+
+            file_path = os.path.join(calib_data_dir, file_name)
+
+            if file_name_suffix == "mp4":
+                stream = cv.VideoCapture(file_path)
+                is_first_frame = True
+                crop_transform = VitTrackCrop()
+                roi = tuple()
+                while stream.isOpened():
+                    ret, frame = stream.read()
+                    if not ret: # end of video
+                        break
+
+                    if is_first_frame:
+                        roi = np.loadtxt(os.path.join(calib_data_dir, file_name.split('.')[0] + '.txt'))
+                        roi_last = roi
+                        x, y, w, h = tuple(roi)
+                        crop = crop_transform(frame, roi, 2)
+                        transforms = Compose([Resize(size=(128, 128)), Normalize(mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375])])
+                        blob = transforms(crop)
+                        blob = cv.dnn.blobFromImage(blob)
+                        blobs.append(blob)
+                        is_first_frame = False
+                    else:
+                        crop = crop_transform(frame, roi, 4)
+                        transforms = Compose([Resize(size=(256, 256)), Normalize(mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375])])
+                        img = transforms(crop)
+                        blob = cv.dnn.blobFromImage(img)
+                        blobs.append(blob)
+            else:
+                img = cv.imread(file_path)
+                img = self.transforms(img)
+                if img is None:
+                    continue
+                blob = cv.dnn.blobFromImage(img)
+                if self.data_dim == 'hwc':
+                    blob = cv.transposeND(blob, [0, 2, 3, 1])
+                blobs.append(blob)
         return blobs
 
 class Quantize:
-    def __init__(self, model_path, calibration_image_dir, transforms=Compose(), per_channel=False, act_type='int8', wt_type='int8', data_dim='chw', nodes_to_exclude=[]):
+    def __init__(self, model_path, calibration_data_dir, transforms=Compose(), per_channel=False, act_type='int8', wt_type='int8', data_dim='chw', nodes_to_exclude=[]):
         self.type_dict = {"uint8" : QuantType.QUInt8, "int8" : QuantType.QInt8}
 
         self.model_path = model_path
-        self.calibration_image_dir = calibration_image_dir
+        self.calibration_data_dir = calibration_data_dir
         self.transforms = transforms
         self.per_channel = per_channel
         self.act_type = act_type
@@ -58,19 +90,19 @@ class Quantize:
         self.nodes_to_exclude = nodes_to_exclude
 
         # data reader
-        self.dr = DataReader(self.model_path, self.calibration_image_dir, self.transforms, data_dim)
+        self.dr = DataReader(self.model_path, self.calibration_data_dir, self.transforms, data_dim)
 
     def check_opset(self):
         model = onnx.load(self.model_path)
-        if model.opset_import[0].version != 13:
-            print('\tmodel opset version: {}. Converting to opset 13'.format(model.opset_import[0].version))
-            # convert opset version to 13
-            model_opset13 = version_converter.convert_version(model, 13)
-            # save converted model
-            output_name = '{}-opset13.onnx'.format(self.model_path[:-5])
-            onnx.save_model(model_opset13, output_name)
-            # update model_path for quantization
-            return output_name
+        # if model.opset_import[0].version != 13:
+        #     print('\tmodel opset version: {}. Converting to opset 13'.format(model.opset_import[0].version))
+        #     # convert opset version to 13
+        #     model_opset13 = version_converter.convert_version(model, 13)
+        #     # save converted model
+        #     output_name = '{}-opset13.onnx'.format(self.model_path[:-5])
+        #     onnx.save_model(model_opset13, output_name)
+        #     # update model_path for quantization
+        #     return output_name
         return self.model_path
 
     def run(self):
@@ -88,44 +120,43 @@ class Quantize:
         print('\tQuantized model saved to {}'.format(output_name))
 
 models=dict(
-    yunet=Quantize(model_path='../../models/face_detection_yunet/face_detection_yunet_2023mar.onnx',
-                   calibration_image_dir='../../benchmark/data/face_detection',
-                   transforms=Compose([Resize(size=(160, 120))]),
-                   nodes_to_exclude=['MaxPool_5', 'MaxPool_18', 'MaxPool_25', 'MaxPool_32'],
-    ),
-    sface=Quantize(model_path='../../models/face_recognition_sface/face_recognition_sface_2021dec.onnx',
-                   calibration_image_dir='../../benchmark/data/face_recognition',
-                   transforms=Compose([Resize(size=(112, 112))])),
-    pphumanseg=Quantize(model_path='../../models/human_segmentation_pphumanseg/human_segmentation_pphumanseg_2023mar.onnx',
-                        calibration_image_dir='../../benchmark/data/human_segmentation',
-                        transforms=Compose([Resize(size=(192, 192))])),
-    ppresnet50=Quantize(model_path='../../models/image_classification_ppresnet/image_classification_ppresnet50_2022jan.onnx',
-                        calibration_image_dir='../../benchmark/data/image_classification',
-                        transforms=Compose([Resize(size=(224, 224))])),
-    # TBD: VitTrack
-    youtureid=Quantize(model_path='../../models/person_reid_youtureid/person_reid_youtu_2021nov.onnx',
-                       calibration_image_dir='../../benchmark/data/person_reid',
-                       transforms=Compose([Resize(size=(128, 256))])),
-    # TBD: DB-EN & DB-CN
-    crnn_en=Quantize(model_path='../../models/text_recognition_crnn/text_recognition_CRNN_EN_2021sep.onnx',
-                     calibration_image_dir='../../benchmark/data/text',
-                     transforms=Compose([Resize(size=(100, 32)), Normalize(mean=[127.5, 127.5, 127.5], std=[127.5, 127.5, 127.5]), ColorConvert(ctype=cv.COLOR_BGR2GRAY)])),
-    crnn_cn=Quantize(model_path='../../models/text_recognition_crnn/text_recognition_CRNN_CN_2021nov.onnx',
-                     calibration_image_dir='../../benchmark/data/text',
-                     transforms=Compose([Resize(size=(100, 32))])),
-    mp_palmdet=Quantize(model_path='../../models/palm_detection_mediapipe/palm_detection_mediapipe_2023feb.onnx',
-                        calibration_image_dir='path/to/dataset',
-                        transforms=Compose([Resize(size=(192, 192)), Normalize(std=[255, 255, 255]),
-                        ColorConvert(ctype=cv.COLOR_BGR2RGB)]), data_dim='hwc'),
-    mp_handpose=Quantize(model_path='../../models/handpose_estimation_mediapipe/handpose_estimation_mediapipe_2023feb.onnx',
-                        calibration_image_dir='path/to/dataset',
-                        transforms=Compose([HandAlign("mp_handpose"), Resize(size=(224, 224)), Normalize(std=[255, 255, 255]),
-                        ColorConvert(ctype=cv.COLOR_BGR2RGB)]), data_dim='hwc'),
-    lpd_yunet=Quantize(model_path='../../models/license_plate_detection_yunet/license_plate_detection_lpd_yunet_2023mar.onnx',
-                       calibration_image_dir='../../benchmark/data/license_plate_detection',
-                       transforms=Compose([Resize(size=(320, 240))]),
-                       nodes_to_exclude=['MaxPool_5', 'MaxPool_18', 'MaxPool_25', 'MaxPool_32', 'MaxPool_39'],
-    ),
+    # yunet=Quantize(model_path='../../models/face_detection_yunet/face_detection_yunet_2023mar.onnx',
+    #                calibration_data_dir='../../benchmark/data/face_detection',
+    #                transforms=Compose([Resize(size=(160, 120))]),
+    #                nodes_to_exclude=['MaxPool_5', 'MaxPool_18', 'MaxPool_25', 'MaxPool_32']),
+    # sface=Quantize(model_path='../../models/face_recognition_sface/face_recognition_sface_2021dec.onnx',
+    #                calibration_data_dir='../../benchmark/data/face_recognition',
+    #                transforms=Compose([Resize(size=(112, 112))])),
+    # pphumanseg=Quantize(model_path='../../models/human_segmentation_pphumanseg/human_segmentation_pphumanseg_2023mar.onnx',
+    #                     calibration_data_dir='../../benchmark/data/human_segmentation',
+    #                     transforms=Compose([Resize(size=(192, 192))])),
+    # ppresnet50=Quantize(model_path='../../models/image_classification_ppresnet/image_classification_ppresnet50_2022jan.onnx',
+    #                     calibration_data_dir='../../benchmark/data/image_classification',
+    #                     transforms=Compose([Resize(size=(224, 224))])),
+    # youtureid=Quantize(model_path='../../models/person_reid_youtureid/person_reid_youtu_2021nov.onnx',
+    #                    calibration_data_dir='../../benchmark/data/person_reid',
+    #                    transforms=Compose([Resize(size=(128, 256))])),
+    # # TBD: DB-EN & DB-CN
+    # crnn_en=Quantize(model_path='../../models/text_recognition_crnn/text_recognition_CRNN_EN_2021sep.onnx',
+    #                  calibration_data_dir='../../benchmark/data/text',
+    #                  transforms=Compose([Resize(size=(100, 32)), Normalize(mean=[127.5, 127.5, 127.5], std=[127.5, 127.5, 127.5]), ColorConvert(ctype=cv.COLOR_BGR2GRAY)])),
+    # crnn_cn=Quantize(model_path='../../models/text_recognition_crnn/text_recognition_CRNN_CN_2021nov.onnx',
+    #                  calibration_data_dir='../../benchmark/data/text',
+    #                  transforms=Compose([Resize(size=(100, 32))])),
+    # mp_palmdet=Quantize(model_path='../../models/palm_detection_mediapipe/palm_detection_mediapipe_2023feb.onnx',
+    #                     calibration_data_dir='path/to/dataset',
+    #                     transforms=Compose([Resize(size=(192, 192)), Normalize(std=[255, 255, 255]),
+    #                     ColorConvert(ctype=cv.COLOR_BGR2RGB)]), data_dim='hwc'),
+    # mp_handpose=Quantize(model_path='../../models/handpose_estimation_mediapipe/handpose_estimation_mediapipe_2023feb.onnx',
+    #                     calibration_data_dir='path/to/dataset',
+    #                     transforms=Compose([HandAlign("mp_handpose"), Resize(size=(224, 224)), Normalize(std=[255, 255, 255]),
+    #                     ColorConvert(ctype=cv.COLOR_BGR2RGB)]), data_dim='hwc'),
+    # lpd_yunet=Quantize(model_path='../../models/license_plate_detection_yunet/license_plate_detection_lpd_yunet_2023mar.onnx',
+    #                    calibration_data_dir='../../benchmark/data/license_plate_detection',
+    #                    transforms=Compose([Resize(size=(320, 240))]),
+    #                    nodes_to_exclude=['MaxPool_5', 'MaxPool_18', 'MaxPool_25', 'MaxPool_32', 'MaxPool_39']),
+    vittrack=Quantize(model_path='../../models/object_tracking_vittrack/object_tracking_vittrack_2023sep.onnx',
+                      calibration_data_dir="../../benchmark/data/object_tracking"),
 )
 
 if __name__ == '__main__':

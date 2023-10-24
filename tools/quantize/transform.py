@@ -8,6 +8,7 @@ import collections
 import numpy as np
 import cv2 as cv
 import sys
+from math import sqrt
 
 class Compose:
     def __init__(self, transforms=[]):
@@ -127,3 +128,25 @@ class HandAlign:
         crop = rotated_image[y1:y2, x1:x2, :]
         crop = cv.copyMakeBorder(crop, diff[1], diff[3], diff[0], diff[2], cv.BORDER_CONSTANT, value=(0, 0, 0))
         return crop
+
+class VitTrackCrop:
+    def __init__(self):
+        pass
+
+    def __call__(self, img, roi, factor=2):
+        x, y, w, h = roi
+        crop_size = round(sqrt(w * h) * factor)
+
+        x1 = int(x + (w - crop_size) / 2)
+        x2 = int(x1 + crop_size)
+        y1 = int(y + (h - crop_size) / 2)
+        y2 = int(y1 + crop_size)
+
+        x1_pad = max(0, -x1)
+        y1_pad = max(0, -y1)
+        x2_pad = max(x2 - img.shape[1] + 1, 0) # h, w, c = img.shape
+        y2_pad = max(y2 - img.shape[0] + 1, 0)
+
+        new_roi = (x1 + x1_pad, y1 + y1_pad, x2 - x2_pad - x1 - x1_pad, y2 - y2_pad - y1 - y1_pad)
+        img_crop = img[new_roi[1]:new_roi[1]+new_roi[3], new_roi[0]:new_roi[0]+new_roi[2], :]
+        return cv.copyMakeBorder(img_crop, y1_pad, y2_pad, x1_pad, x2_pad, cv.BORDER_CONSTANT)
